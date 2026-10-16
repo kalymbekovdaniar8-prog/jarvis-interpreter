@@ -1,0 +1,127 @@
+name: Build JARVIS for Windows
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-windows.yml'
+      - 'scripts/**'
+      - 'README.md'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jarvis-windows-build
+  cancel-in-progress: true
+
+jobs:
+  build-windows:
+    name: Windows x64 installer
+    runs-on: windows-latest
+    timeout-minutes: 150
+    env:
+      NODE_OPTIONS: --max-old-space-size=6144
+      UPSTREAM_SHA: f88bca02b9353167e2b5790f59ff48ce4ccd5015
+    steps:
+      - name: Checkout JARVIS control repo
+        uses: actions/checkout@v7
+        with:
+          path: control
+
+      - name: Checkout pinned Interpreter Workstation source
+        uses: actions/checkout@v7
+        with:
+          repository: openinterpreter/interpreter-workstation
+          ref: ${{ env.UPSTREAM_SHA }}
+          submodules: recursive
+          fetch-depth: 1
+          path: source
+
+      - name: Apply JARVIS customization
+        shell: pwsh
+        run: node control/scripts/customize-jarvis.mjs source
+
+      - name: Setup pnpm 9.15.9
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9.15.9
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: source/pnpm-lock.yaml
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2.2.0
+        with:
+          bun-version: 1.2.20
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Use Visual Studio compatible node-gyp
+        shell: pwsh
+        run: |
+          npm install --global node-gyp@12.3.0
+          "npm_config_node_gyp=$(npm root --global)\node-gyp\bin\node-gyp.js" >> $env:GITHUB_ENV
+
+      - name: Verify pinned submodules
+        shell: pwsh
+        working-directory: source
+        run: |
+          git submodule status --recursive
+          if (-not (Test-Path 'apps/interpreter-extension')) { throw 'Missing interpreter-extension submodule' }
+          if (-not (Test-Path 'submodules/interpreter-cua')) { throw 'Missing interpreter-cua submodule' }
+
+      - name: Install dependencies
+        shell: pwsh
+        working-directory: source
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: pnpm install --frozen-lockfile
+
+      - name: Download local runtimes
+        shell: pwsh
+        working-directory: source
+        run: |
+          pnpm run download:oix -- --current-platform
+          pnpm run download:pdfcpu -- --current-platform
+          pnpm run download:qwen-asr -- --current-platform
+
+      - name: Build app
+        shell: pwsh
+        working-directory: source
+        run: |
+          pnpm run build:js-repl-runtime
+          pnpm run build
+
+      - name: Package unsigned Windows installer
+        shell: pwsh
+        working-directory: source
+        run: pnpm exec electron-builder --win nsis --x64 --publish never
+
+      - name: Collect installer
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          $installer = Get-ChildItem 'source/dist' -File -Filter '*.exe' |
+            Where-Object { $_.Name -notmatch 'uninstall' } |
+            Sort-Object Length -Descending |
+            Select-Object -First 1
+          if (-not $installer) { throw 'Windows installer was not produced.' }
+          Copy-Item $installer.FullName 'artifacts/JARVIS-Setup-0.3.1.exe'
+          $hash = (Get-FileHash 'artifacts/JARVIS-Setup-0.3.1.exe' -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  JARVIS-Setup-0.3.1.exe" | Set-Content 'artifacts/SHA256SUMS.txt' -Encoding ascii
+          Get-ChildItem artifacts | Format-Table Name,Length
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: JARVIS-Windows-x64-0.3.1
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 14
