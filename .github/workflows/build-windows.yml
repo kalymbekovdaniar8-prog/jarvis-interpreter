@@ -30,6 +30,10 @@ jobs:
         with:
           path: control
 
+      - name: Preserve LF line endings for source patches
+        shell: pwsh
+        run: git config --global core.autocrlf false
+
       - name: Checkout pinned Interpreter Workstation source
         uses: actions/checkout@v7
         with:
